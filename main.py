@@ -224,6 +224,10 @@ class ArbitrageEngine:
                 fee=updated_pos.get("fee_total", 0),
                 net_pnl=updated_pos.get("net_pnl", 0),
                 duration_sec=duration,
+                entry_price_bybit=updated_pos.get("entry_price_bybit"),
+                entry_price_gateio=updated_pos.get("entry_price_gateio"),
+                signal_spread_pct=updated_pos.get("signal_spread_pct"),
+                slippage_pct=updated_pos.get("slippage_pct"),
             )
 
     async def start(self):
@@ -268,8 +272,8 @@ class ArbitrageEngine:
 
         await self.notifier.notify_engine_stop(
             reason=reason,
-            trade_count=summary.get("count", 0),
-            net_pnl=summary.get("net_pnl", 0),
+            trade_count=summary.get("total_trades", 0),
+            net_pnl=summary.get("total_pnl", 0),
         )
 
         logger.info(f"Engine stopped. Closed {closed} positions.")
