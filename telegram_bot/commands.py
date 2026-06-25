@@ -7,7 +7,7 @@ from utils.formatter import *
 logger = get_logger('commands')
 
 def _esc(text: str) -> str:
-    """Escape MarkdownV2 special chars in dynamic values."""
+    """Escape MarkdownV2 special chars in dynamic values (produces single backslash)."""
     for ch in '._~`>#+-=|{}()!':
         text = text.replace(ch, '\\' + ch)
     return text
@@ -62,7 +62,7 @@ class CommandHandler:
         action = args[0]
         if action == 'on':
             if self.engine and self.engine.running:
-                await update.message.reply_text("⚠️ Engine already running")
+                await update.message.reply_text("⏳ Engine already running")
                 return
             if self.engine:
                 await self.engine.start()
@@ -110,7 +110,7 @@ class CommandHandler:
             conns = ws_status.get(exchange, [])
             for conn in conns:
                 emoji = '🟢' if conn['status'] == 'connected' else '🔴'
-                text += f"{emoji} {exchange} \\#{conn['index']}: `{_esc(conn['status'])}` ({conn['symbols']} pairs)\n"
+                text += f"{emoji} {exchange} \\#{conn['index']}: `{_esc(conn['status'])}` \\({conn['symbols']} pairs\\)\n"
         
         await update.message.reply_text(text, parse_mode='MarkdownV2')
     
@@ -124,7 +124,7 @@ class CommandHandler:
             return
         
         if self.engine and self.engine.running:
-            await update.message.reply_text("⚠️ Stop engine first: /auto off")
+            await update.message.reply_text("⏳ Stop engine first: /auto off")
             return
         
         new_mode = args[0]
@@ -151,7 +151,7 @@ class CommandHandler:
         
         if mode == 'paper':
             balance = self.engine.paper_engine.get_balance() if self.engine.paper_engine else 0
-            text += f"💵 Balance: `{balance:.2f}` USDT\n"
+            text += f"💵 Balance: `{_esc(f'{balance:.2f}')}` USDT\n"
         else:
             text += "💵 Fetching live balances\\.\\.\\.\n"
         
@@ -159,8 +159,7 @@ class CommandHandler:
         
         if positions:
             for pos in positions:
-                esc_size = str(pos['size_usdt']).replace('.', '\\.')
-                text += f"• `{pos['symbol']}` {pos['direction']} ({esc_size} USDT)\n"
+                text += f"• `{pos['symbol']}` {pos['direction']} \\({_esc(str(pos['size_usdt']))} USDT\\)\n"
         
         await update.message.reply_text(text, parse_mode='MarkdownV2')
     
@@ -177,15 +176,14 @@ class CommandHandler:
             for t in trades[:10]:
                 net = t.get('net_pnl', 0) or 0
                 emoji = '🟢' if net >= 0 else '🔴'
-                esc_net = f"{net:.4f}".replace('.', '\\.')
-                text += f"{emoji} `{t['symbol']}` {t.get('direction','')} net=`{esc_net}`\n"
+                text += f"{emoji} `{t['symbol']}` {t.get('direction','')} net=`{_esc(f'{net:.4f}')}`\n"
         else:
             text = "📈 *Trade Summary*\n\n"
             for days, label in [(1, '24h'), (7, '7d'), (30, '30d')]:
                 if self.engine:
                     summary = await self.engine.db.get_trade_summary(mode, days)
-                    esc_pnl = f"{summary.get('net_pnl', 0):.4f}".replace('.', '\\.')
-                    text += f"{label}: `{summary.get('count', 0)}` trades, net PnL: `{esc_pnl}` USDT\n"
+                    net_pnl = summary.get('net_pnl', 0) or 0
+                    text += f"{label}: `{summary.get('count', 0)}` trades, net PnL: `{_esc(f'{net_pnl:.4f}')}` USDT\n"
         
         await update.message.reply_text(text, parse_mode='MarkdownV2')
     
@@ -211,8 +209,7 @@ class CommandHandler:
         else:
             for sym, spread in spreads[:5]:
                 direction = "📈" if spread > 0 else "📉"
-                esc_spread = f"{spread:.3f}%".replace('.', '\\.')
-                text += f"{direction} `{sym}`: `{esc_spread}`\n"
+                text += f"{direction} `{sym}`: `{_esc(f'{spread:.3f}%')}`\n"
         
         await update.message.reply_text(text, parse_mode='MarkdownV2')
     
