@@ -147,7 +147,7 @@ class CommandHandler:
         mode = self.engine.settings.trading_mode if self.engine else 'paper'
         positions = self.engine.position_tracker.get_all_open() if self.engine else []
         
-        text = f"💰 *Portfolio* ({_esc(mode)})\n\n"
+        text = f"💰 *Portfolio* \\({_esc(mode)}\\)\n\n"
         
         if mode == 'paper':
             balance = self.engine.paper_engine.get_balance() if self.engine.paper_engine else 0
@@ -184,7 +184,8 @@ class CommandHandler:
             for days, label in [(1, '24h'), (7, '7d'), (30, '30d')]:
                 if self.engine:
                     summary = await self.engine.db.get_trade_summary(mode, days)
-                    text += f"{label}: `{summary.get('count', 0)}` trades, net PnL: `{summary.get('net_pnl', 0):.4f}` USDT\n"
+                    esc_pnl = f"{summary.get('net_pnl', 0):.4f}".replace('.', '\\.')
+                    text += f"{label}: `{summary.get('count', 0)}` trades, net PnL: `{esc_pnl}` USDT\n"
         
         await update.message.reply_text(text, parse_mode='MarkdownV2')
     
