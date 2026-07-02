@@ -1,5 +1,9 @@
 import time
+import asyncio
 from database.models import Signal, PriceData, OrderResult, PositionRecord, Direction
+from core.orderbook_cache import OrderbookCache
+
+SLIPPAGE_FALLBACK_PCT = 0.0005  # 0.05% fallback if no orderbook data
 
 
 class PaperEngine:
@@ -11,32 +15,65 @@ class PaperEngine:
         taker_fee_gateio: float,
     ):
         self.balance = initial_balance
-        self.slippage_pct = slippage_pct
+        self.slippage_pct = slippage_pct  # flat fallback
         self.taker_fee_bybit = taker_fee_bybit
         self.taker_fee_gateio = taker_fee_gateio
         self.initial_balance = initial_balance
+        self.ob_cache: OrderbookCache = None  # set externally by executor
+
+    async def _vwap_fill_price(
+        self, exchange: str, symbol: str, side: str, size_usdt: float,
+    ) -> float:
+        """
+        Calculate realistic fill price using VWAP from orderbook cache.
+        Falls back to flat slippage if no orderbook data.
+        """
+        if self.ob_cache:
+            vwap = self.ob_cache.vwap_fill(exchange, symbol, size_usdt, side)
+            if vwap is not None and vwap > 0:
+                return vwap
+        return 0.0  # signal to use fallback
 
     async def execute_entry(
-        self, signal: Signal, size_usdt: float, leverage: int
+        self, signal: Signal, size_usdt: float, leverage: int,
     ) -> tuple[OrderResult, OrderResult]:
-        """Simulate both legs of entry. Returns (bybit_result, gateio_result)."""
-        slippage = self.slippage_pct  # Already in decimal form (0.0005 = 0.05%)
+        """Simulate both legs of entry with realistic VWAP slippage."""
+        slip_flat = self.slippage_pct
 
         if signal.direction == Direction.LONG_BYBIT:
             # Long Bybit (buy at ask), Short Gate.io (sell at bid)
-            bybit_price = signal.price_bybit.ask * (1 + slippage)
-            gateio_price = signal.price_gateio.bid * (1 - slippage)
+            bybit_base = signal.price_bybit.ask
+            gateio_base = signal.price_gateio.bid
             bybit_side = "buy"
             gateio_side = "sell"
+            long_exchange = "bybit"
+            short_exchange = "gateio"
         else:
             # Long Gate.io (buy at ask), Short Bybit (sell at bid)
-            gateio_price = signal.price_gateio.ask * (1 + slippage)
-            bybit_price = signal.price_bybit.bid * (1 - slippage)
+            gateio_base = signal.price_gateio.ask
+            bybit_base = signal.price_bybit.bid
             bybit_side = "sell"
             gateio_side = "buy"
+            long_exchange = "gateio"
+            short_exchange = "bybit"
+
+        # --- VWAP-based fill (realistic) ---
+        # Long leg: buy at ask side, short leg: sell at bid side
+        if long_exchange == "bybit":
+            bybit_price = await self._vwap_fill_price("bybit", signal.symbol, "ask", size_usdt)
+            gateio_price = await self._vwap_fill_price("gateio", signal.symbol, "bid", size_usdt)
+        else:
+            gateio_price = await self._vwap_fill_price("gateio", signal.symbol, "ask", size_usdt)
+            bybit_price = await self._vwap_fill_price("bybit", signal.symbol, "bid", size_usdt)
+
+        # Fallback to flat slippage if VWAP unavailable
+        if bybit_price <= 0:
+            bybit_price = bybit_base * (1 + slip_flat) if bybit_side == "buy" else bybit_base * (1 - slip_flat)
+        if gateio_price <= 0:
+            gateio_price = gateio_base * (1 + slip_flat) if gateio_side == "buy" else gateio_base * (1 - slip_flat)
 
         # Use the LONG leg's entry price for quantity calculation
-        long_price = bybit_price if signal.direction == Direction.LONG_BYBIT else gateio_price
+        long_price = bybit_price if long_exchange == "bybit" else gateio_price
         quantity = size_usdt / long_price
 
         fee_bybit = size_usdt * self.taker_fee_bybit
@@ -46,7 +83,6 @@ class PaperEngine:
         # Margin required: size / leverage (simplified)
         margin = size_usdt / leverage
         if margin + total_fees > self.balance:
-            # Not enough balance
             err = OrderResult(
                 success=False, exchange="bybit", symbol=signal.symbol,
                 side=bybit_side, price=0, quantity=0, fee=0,
@@ -54,7 +90,7 @@ class PaperEngine:
             )
             return err, err
 
-        self.balance -= total_fees  # Deduct fees from balance
+        self.balance -= total_fees
 
         bybit_result = OrderResult(
             success=True,
@@ -86,28 +122,48 @@ class PaperEngine:
         exit_bybit: PriceData,
         exit_gateio: PriceData,
     ) -> tuple[OrderResult, OrderResult]:
-        """Simulate both legs of exit. Returns (bybit_result, gateio_result)."""
-        slippage = self.slippage_pct  # Already in decimal form (0.0005 = 0.05%)
+        """Simulate exit with realistic VWAP slippage."""
+        slip_flat = self.slippage_pct
 
-        entry_qty = position.size_usdt / position.entry_price_bybit
+        if position.direction == Direction.LONG_BYBIT.value:
+            entry_qty = position.size_usdt / position.entry_price_bybit
+        else:
+            entry_qty = position.size_usdt / position.entry_price_gateio
+
+        exit_size_usdt = entry_qty * (
+            exit_bybit.bid if position.direction == Direction.LONG_BYBIT.value else exit_bybit.ask
+        )
 
         if position.direction == Direction.LONG_BYBIT.value:
             # Close long at bid, close short at ask
-            bybit_exit_price = exit_bybit.bid * (1 - slippage)
-            gateio_exit_price = exit_gateio.ask * (1 + slippage)
+            bybit_exit_price = await self._vwap_fill_price("bybit", position.symbol, "bid", exit_size_usdt)
+            gateio_exit_price = await self._vwap_fill_price("gateio", position.symbol, "ask", exit_size_usdt)
             bybit_side = "sell"
             gateio_side = "buy"
-            # PnL: long profit on Bybit, short profit on Gate.io
             pnl_bybit = (bybit_exit_price - position.entry_price_bybit) * entry_qty
             pnl_gateio = (position.entry_price_gateio - gateio_exit_price) * entry_qty
         else:
             # Close short at ask on Bybit, close long at bid on Gate.io
-            bybit_exit_price = exit_bybit.ask * (1 + slippage)
-            gateio_exit_price = exit_gateio.bid * (1 - slippage)
+            bybit_exit_price = await self._vwap_fill_price("bybit", position.symbol, "ask", exit_size_usdt)
+            gateio_exit_price = await self._vwap_fill_price("gateio", position.symbol, "bid", exit_size_usdt)
             bybit_side = "buy"
             gateio_side = "sell"
             pnl_bybit = (position.entry_price_bybit - bybit_exit_price) * entry_qty
             pnl_gateio = (gateio_exit_price - position.entry_price_gateio) * entry_qty
+
+        # Fallback to flat slippage if VWAP unavailable
+        if bybit_exit_price <= 0:
+            bybit_exit_price = (
+                exit_bybit.bid * (1 - slip_flat)
+                if position.direction == Direction.LONG_BYBIT.value
+                else exit_bybit.ask * (1 + slip_flat)
+            )
+        if gateio_exit_price <= 0:
+            gateio_exit_price = (
+                exit_gateio.ask * (1 + slip_flat)
+                if position.direction == Direction.LONG_BYBIT.value
+                else exit_gateio.bid * (1 - slip_flat)
+            )
 
         exit_size_bybit = entry_qty * bybit_exit_price
         exit_size_gateio = entry_qty * gateio_exit_price
@@ -118,8 +174,6 @@ class PaperEngine:
 
         gross_pnl = pnl_bybit + pnl_gateio
         net_pnl = gross_pnl - total_fees
-
-        # Return fees + pnl to balance
         self.balance += net_pnl
 
         bybit_result = OrderResult(

@@ -68,6 +68,22 @@ class Settings:
     paper_initial_balance_usdt: float
     paper_slippage_pct: float
 
+    # Rebalance
+    rebalance_enabled: bool
+    rebalance_mode: str  # 'demo' | 'live'
+    rebalance_threshold_usdt: float
+    rebalance_threshold_pct: float
+    rebalance_min_transfer: float
+    rebalance_max_transfer: float
+    rebalance_target_ratio: float
+    rebalance_check_interval_sec: int
+    rebalance_auto_enabled: bool
+    rebalance_require_confirm: bool
+    rebalance_network: str
+    rebalance_max_daily_usdt: float
+    bybit_deposit_address: str
+    gateio_deposit_address: str
+
     # Logging
     log_level: str
     log_file: str
@@ -189,6 +205,24 @@ def load_settings(env_file: str | None = None) -> Settings:
     paper_initial_balance_usdt = _get_float("PAPER_INITIAL_BALANCE_USDT", 1000.0)
     paper_slippage_pct = _get_float("PAPER_SLIPPAGE_PCT", 0.0005)
 
+    # --- Rebalance ---
+    rebalance_enabled = _get_bool("REBALANCE_ENABLED", False)
+    rebalance_mode = _get_str("REBALANCE_MODE", "demo").lower()
+    if rebalance_mode not in ("demo", "live"):
+        raise ValueError(f"REBALANCE_MODE must be 'demo' or 'live', got: {rebalance_mode!r}")
+    rebalance_threshold_usdt = _get_float("REBALANCE_THRESHOLD_USDT", 100.0)
+    rebalance_threshold_pct = _get_float("REBALANCE_THRESHOLD_PCT", 15.0)
+    rebalance_min_transfer = _get_float("REBALANCE_MIN_TRANSFER", 50.0)
+    rebalance_max_transfer = _get_float("REBALANCE_MAX_TRANSFER", 500.0)
+    rebalance_target_ratio = _get_float("REBALANCE_TARGET_RATIO", 0.5)
+    rebalance_check_interval_sec = _get_int("REBALANCE_CHECK_INTERVAL_SEC", 300)
+    rebalance_auto_enabled = _get_bool("REBALANCE_AUTO", False)
+    rebalance_require_confirm = _get_bool("REBALANCE_REQUIRE_CONFIRM", True)
+    rebalance_network = _get_str("REBALANCE_NETWORK", "TRC20")
+    rebalance_max_daily_usdt = _get_float("REBALANCE_MAX_DAILY_USDT", 1000.0)
+    bybit_deposit_address = _get_str("BYBIT_DEPOSIT_ADDRESS", "")
+    gateio_deposit_address = _get_str("GATEIO_DEPOSIT_ADDRESS", "")
+
     log_level = _get_str("LOG_LEVEL", "INFO").upper()
     log_file = _get_str("LOG_FILE", "logs/arb_bot.log")
 
@@ -227,6 +261,20 @@ def load_settings(env_file: str | None = None) -> Settings:
         orderbook_depth=orderbook_depth,
         paper_initial_balance_usdt=paper_initial_balance_usdt,
         paper_slippage_pct=paper_slippage_pct,
+        rebalance_enabled=rebalance_enabled,
+        rebalance_mode=rebalance_mode,
+        rebalance_threshold_usdt=rebalance_threshold_usdt,
+        rebalance_threshold_pct=rebalance_threshold_pct,
+        rebalance_min_transfer=rebalance_min_transfer,
+        rebalance_max_transfer=rebalance_max_transfer,
+        rebalance_target_ratio=rebalance_target_ratio,
+        rebalance_check_interval_sec=rebalance_check_interval_sec,
+        rebalance_auto_enabled=rebalance_auto_enabled,
+        rebalance_require_confirm=rebalance_require_confirm,
+        rebalance_network=rebalance_network,
+        rebalance_max_daily_usdt=rebalance_max_daily_usdt,
+        bybit_deposit_address=bybit_deposit_address,
+        gateio_deposit_address=gateio_deposit_address,
         log_level=log_level,
         log_file=log_file,
         internal_threshold=internal_threshold,

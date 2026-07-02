@@ -35,6 +35,8 @@ class ArbitrageBot:
         self.app.add_handler(CommandHandler('history', cmds.cmd_history))
         self.app.add_handler(CommandHandler('top', cmds.cmd_top))
         self.app.add_handler(CommandHandler('cancel', cmds.cmd_cancel))
+        self.app.add_handler(CommandHandler('balance', cmds.cmd_balance))
+        self.app.add_handler(CommandHandler('rebalance', cmds.cmd_rebalance))
         
         # Set bot commands menu (tolerate timeout)
         commands = [
@@ -47,6 +49,8 @@ class ArbitrageBot:
             BotCommand('history', 'Trade history & PnL'),
             BotCommand('top', 'Top spread pairs'),
             BotCommand('cancel', 'Cancel pending orders'),
+            BotCommand('balance', 'Show exchange balances'),
+            BotCommand('rebalance', 'Trigger/manage rebalance'),
         ]
         try:
             await self.app.bot.set_my_commands(commands)

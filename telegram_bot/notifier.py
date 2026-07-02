@@ -203,3 +203,115 @@ class Notifier:
         for s in new_symbols[:10]:
             lines.append(f"• `{esc(s)}`")
         await self.send("\n".join(lines))
+
+    # ── Rebalance notifications ─────────────────────────────────
+
+    async def notify_rebalance_needed(self, balances: dict, imbalance: dict) -> None:
+        bybit_pct = (balances['bybit'] / balances['total'] * 100) if balances['total'] > 0 else 0
+        gateio_pct = (balances['gateio'] / balances['total'] * 100) if balances['total'] > 0 else 0
+        text = (
+            f"⚖️ *Rebalance Needed*\n"
+            f"{SEP}\n"
+            f"Bybit     `{fmt_usdt(balances['bybit'])}`  \\({esc(f'{bybit_pct:.1f}')}%\\)\n"
+            f"Gate\\.io  `{fmt_usdt(balances['gateio'])}`  \\({esc(f'{gateio_pct:.1f}')}%\\)\n"
+            f"Diff      `{fmt_usdt(imbalance['diff_usdt'])}`\n"
+            f"{SEP}\n"
+            f"Suggested transfer:\n"
+            f"  `{fmt_usdt(imbalance['transfer_amount'])}` "
+            f"{esc(imbalance['from_exchange'].capitalize())} → {esc(imbalance['to_exchange'].capitalize())}\n"
+            f"  Network: {esc(imbalance.get('network', 'TRC20'))}\n"
+            f"{SEP}\n"
+            f"Reply `/rebalance` to execute"
+        )
+        await self.send(text)
+
+    async def notify_rebalance_initiated(
+        self, from_exchange: str, to_exchange: str, amount: float,
+        fee: float, network: str, tx_id: str,
+    ) -> None:
+        text = (
+            f"🔄 *Transfer Initiated*\n"
+            f"{SEP}\n"
+            f"From    {esc(from_exchange.capitalize())}\n"
+            f"To      {esc(to_exchange.capitalize())}\n"
+            f"Amount  `{fmt_usdt(amount)}`\n"
+            f"Fee     `\\-{esc(f'{fee:.2f}')}` USDT\n"
+            f"Network {esc(network)}\n"
+            f"TX      `{esc(tx_id)}`\n"
+            f"{SEP}\n"
+            f"Waiting for confirmation\\.\\.\\.\n"
+            f"\\(usually 1\\-3 minutes\\)\n"
+            f"🕐 {_ts()}"
+        )
+        await self.send(text)
+
+    async def notify_rebalance_confirmed(
+        self, from_exchange: str, to_exchange: str, amount: float,
+        fee: float, tx_id: str, elapsed_sec: int, balances_after: dict,
+    ) -> None:
+        bybit_pct = (balances_after['bybit'] / balances_after['total'] * 100) if balances_after['total'] > 0 else 0
+        gateio_pct = (balances_after['gateio'] / balances_after['total'] * 100) if balances_after['total'] > 0 else 0
+        text = (
+            f"✅ *Transfer Confirmed*\n"
+            f"{SEP}\n"
+            f"{esc(from_exchange.capitalize())} → {esc(to_exchange.capitalize())}  `{fmt_usdt(amount)}`\n"
+            f"Fee     `\\-{esc(f'{fee:.2f}')}` USDT\n"
+            f"Time    `{esc(fmt_duration(elapsed_sec))}`\n"
+            f"{SEP}\n"
+            f"*New Balances*\n"
+            f"Bybit     `{fmt_usdt(balances_after['bybit'])}`  \\({esc(f'{bybit_pct:.1f}')}%\\)\n"
+            f"Gate\\.io  `{fmt_usdt(balances_after['gateio'])}`  \\({esc(f'{gateio_pct:.1f}')}%\\)\n"
+            f"{SEP}\n"
+            f"TX `{esc(tx_id)}`\n"
+            f"🕐 {_ts()}"
+        )
+        await self.send(text)
+
+    async def notify_rebalance_executed(
+        self, mode: str, from_exchange: str, to_exchange: str, amount: float,
+        status: str, balances_before: dict, balances_after: dict,
+    ) -> None:
+        tag = f" [{mode.upper()}]" if mode == "demo" else ""
+        bybit_pct = (balances_after['bybit'] / balances_after['total'] * 100) if balances_after['total'] > 0 else 0
+        gateio_pct = (balances_after['gateio'] / balances_after['total'] * 100) if balances_after['total'] > 0 else 0
+        text = (
+            f"🔄 *Transfer Simulated*{esc(tag)}\n"
+            f"{SEP}\n"
+            f"{esc(from_exchange.capitalize())} → {esc(to_exchange.capitalize())}  `{fmt_usdt(amount)}`\n"
+            f"Fee     `\\-0\\.00` USDT \\(simulated\\)\n"
+            f"{SEP}\n"
+            f"*Virtual Balances After*\n"
+            f"Bybit     `{fmt_usdt(balances_after['bybit'])}`  \\({esc(f'{bybit_pct:.1f}')}%\\)\n"
+            f"Gate\\.io  `{fmt_usdt(balances_after['gateio'])}`  \\({esc(f'{gateio_pct:.1f}')}%\\)\n"
+            f"{SEP}\n"
+            f"🕐 {_ts()}"
+        )
+        await self.send(text)
+
+    async def notify_rebalance_failed(
+        self, from_exchange: str, to_exchange: str, amount: float, error: str,
+    ) -> None:
+        text = (
+            f"🔴 *Transfer Failed — Manual Check Required*\n"
+            f"{SEP}\n"
+            f"From    {esc(from_exchange.capitalize())}\n"
+            f"To      {esc(to_exchange.capitalize())}\n"
+            f"Amount  `{fmt_usdt(amount)}`\n"
+            f"Error   {esc(error)}\n"
+            f"{SEP}\n"
+            f"Check exchange withdrawal history manually\n"
+            f"🕐 {_ts()}"
+        )
+        await self.send(text)
+
+    async def notify_rebalance_timeout(self, tx_id: str, elapsed_sec: int) -> None:
+        text = (
+            f"🔴 *Transfer Monitoring Timeout*\n"
+            f"{SEP}\n"
+            f"TX      `{esc(tx_id)}`\n"
+            f"Elapsed `{esc(fmt_duration(elapsed_sec))}`\n"
+            f"Action  Check exchange withdrawal history manually\n"
+            f"{SEP}\n"
+            f"🕐 {_ts()}"
+        )
+        await self.send(text)

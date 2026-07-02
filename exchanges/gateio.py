@@ -343,3 +343,85 @@ class GateioClient(ExchangeClient):
                         'leverage': float(p.get('leverage', 1)),
                     })
         return positions
+
+    async def withdraw_usdt(self, address: str, amount: float, network: str = 'TRC20') -> dict:
+        """
+        Initiate USDT withdrawal from Gate.io.
+
+        API: POST /api/v4/withdrawals
+        Docs: https://www.gate.io/docs/developers/apiv4/#withdraw
+
+        Gate.io chain mapping — parameter 'chain' di API withdrawal:
+          TRC20  → 'TRX'    (Tron)
+          ERC20  → 'ETH'    (Ethereum)
+          BEP20  → 'BSC'    (BNB Smart Chain)
+          ARBITRUM → 'ARBITRUM'
+          OPTIMISM → 'OPTIMISM'
+          BASE   → 'BASE'
+          POLYGON → 'MATIC'
+          SOLANA → 'SOL'
+          TON    → 'TON'
+          AVAX_C → 'AVAX_C'  (Avalanche C-Chain)
+        """
+        chain_map = {
+            'TRC20': 'TRX',
+            'ERC20': 'ETH',
+            'BEP20': 'BSC',
+            'ARBITRUM': 'ARBITRUM',
+            'OPTIMISM': 'OPTIMISM',
+            'BASE': 'BASE',
+            'POLYGON': 'MATIC',
+            'SOLANA': 'SOL',
+            'TON': 'TON',
+            'AVAX_C': 'AVAX_C',
+        }
+        params = {
+            'currency': 'USDT',
+            'address': address,
+            'amount': str(round(amount, 2)),
+            'chain': chain_map.get(network, 'TRX'),
+        }
+        logger.info("Gate.io withdraw_usdt: %.2f USDT -> %s (%s)", amount, address, network)
+        result = await self._rest_post('/api/v4/withdrawals', params)
+        return {
+            'tx_id': str(result.get('id', '')),
+            'fee': float(result.get('fee', 1.0)),
+        }
+
+    # ── Instrument info cache (for quantity rounding) ────────────
+    _contract_info: dict[str, dict] = {}
+
+    async def fetch_instrument_info(self, symbol: str) -> dict:
+        """Fetch contract info with size limits. Cached 1h."""
+        # symbol is Gate.io format: BTC_USDT
+        if symbol in self._contract_info:
+            return self._contract_info[symbol]
+        try:
+            data = await self._rest_get(f'/api/v4/futures/usdt/contracts/{symbol}')
+            info = {
+                'order_size_min': float(data.get('order_size_min', 1)),
+                'order_size_max': float(data.get('order_size_max', 1000000)),
+                'order_price_round': float(data.get('order_price_round', 0.0001)),
+            }
+        except Exception:
+            info = {
+                'order_size_min': 1.0,
+                'order_size_max': 1000000.0,
+                'order_price_round': 0.0001,
+            }
+        self._contract_info[symbol] = info
+        return info
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        """Round qty to valid size for the contract."""
+        # Gate.io futures size is in USD (contracts), not coins
+        info = self._contract_info.get(symbol, {})
+        min_q = info.get('order_size_min', 1)
+        max_q = info.get('order_size_max', 1000000)
+        # Gate.io accepts integer sizes for USDT-margined contracts
+        rounded = max(1, round(qty))
+        if rounded < min_q:
+            return min_q
+        if rounded > max_q:
+            return max_q
+        return float(rounded)

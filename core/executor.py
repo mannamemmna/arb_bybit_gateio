@@ -5,6 +5,36 @@ from utils.logger import get_logger
 
 logger = get_logger('executor')
 
+
+# Maximum allowed quantity mismatch between legs (1%)
+MAX_QTY_MISMATCH_PCT = 1.0
+
+
+def _get_qty(result) -> float:
+    """Extract quantity from OrderResult (paper) or dict (live)."""
+    if hasattr(result, 'quantity'):
+        return float(result.quantity)
+    return float(result.get('quantity', 0))
+
+
+def _get_success(result) -> bool:
+    if hasattr(result, 'success'):
+        return result.success
+    return result.get('success', False)
+
+
+def _get_price(result) -> float:
+    if hasattr(result, 'price'):
+        return float(result.price)
+    return float(result.get('price', 0))
+
+
+def _get_error(result) -> Optional[str]:
+    if hasattr(result, 'error'):
+        return result.error
+    return result.get('error')
+
+
 class OrderExecutor:
     """
     Handles order placement for both exchanges.
@@ -12,6 +42,9 @@ class OrderExecutor:
     Execution flow:
       Signal from Spread Engine
            |
+           v
+      [0] Multi-Exchange Health Check -> SKIP if one exchange unreachable
+           | PASS
            v
       [1] Spread Decay Check -> SKIP if decaying
            | PASS
@@ -22,13 +55,13 @@ class OrderExecutor:
       [3] Pre-Flight Re-validate -> SKIP if stale/decayed
            | PASS
            v
-      [4] asyncio.gather() -> send order to BOTH exchanges SIMULTANEOUSLY
+      [4] Quantity rounding -> round to valid lot step
+           | PASS
+           v
+      [5] asyncio.gather() -> send order to BOTH exchanges SIMULTANEOUSLY
            |
            v
-      [5] Validate fill -> if one leg fails, market-close the successful leg
-    
-    - Live mode: market orders via REST (parallel asyncio.gather)
-    - Paper mode: simulated fill at ask/bid + PAPER_SLIPPAGE_PCT
+      [6] Validate fill + partial fill check -> if mismatch, abort
     """
     
     def __init__(self, bybit_client, gateio_client, price_cache,
@@ -43,21 +76,58 @@ class OrderExecutor:
         self.mode = mode
         self.settings = settings
         self._execution_count = 0
-    
+
+    async def _health_check(self, symbol: str) -> bool:
+        """
+        FIX 4: Quick health check — verify both exchanges have recent prices
+        and WS connections are live (via staleness check).
+        """
+        now = time.time() * 1000
+        bybit_px = self.price_cache.get('bybit', symbol)
+        gateio_px = self.price_cache.get('gateio', symbol)
+
+        if not bybit_px or (now - bybit_px.ts) > self.settings.preflight_max_age_ms * 2:
+            logger.warning(f"[{symbol}] HEALTH CHECK FAILED: bybit price too stale or missing")
+            return False
+        if not gateio_px or (now - gateio_px.ts) > self.settings.preflight_max_age_ms * 2:
+            logger.warning(f"[{symbol}] HEALTH CHECK FAILED: gateio price too stale or missing")
+            return False
+
+        # Simple heuristic: if prices are within 1000ms, exchange is alive
+        return True
+
+    async def _round_entry_qty(self, symbol: str, raw_qty: float) -> tuple[float, float]:
+        """FIX 3: Round qty to valid lot step for both exchanges."""
+        gateio_symbol = self._gateio_sym(symbol)
+
+        try:
+            bybit_info = await self.bybit.fetch_instrument_info(symbol)
+            bybit_qty = self.bybit.round_qty(symbol, raw_qty)
+        except Exception:
+            logger.warning(f"[{symbol}] Bybit instrument info failed, using raw qty")
+            bybit_qty = raw_qty
+
+        try:
+            gateio_info = await self.gateio.fetch_instrument_info(gateio_symbol)
+            gateio_qty = self.gateio.round_qty(gateio_symbol, raw_qty)
+        except Exception:
+            logger.warning(f"[{symbol}] Gate.io contract info failed, using raw qty")
+            gateio_qty = raw_qty
+
+        return bybit_qty, gateio_qty
+
     async def execute_entry(self, signal) -> bool:
         """
         Execute entry for a signal. Returns True if successful.
-        
-        Steps:
-        1. Pre-flight re-validate (fresh prices, spread still valid)
-        2. If live: set leverage on both exchanges
-        3. Send market orders to both exchanges simultaneously
-        4. Validate fills
-        5. Record position
         """
         symbol = signal.symbol
         start_time = time.time()
         
+        # FIX 4: Health check before anything else
+        if not await self._health_check(symbol):
+            logger.warning(f"[{symbol}] Entry SKIPPED: exchange health check failed")
+            return False
+
         # Pre-flight re-validate
         fresh_bybit = self.price_cache.get('bybit', symbol)
         fresh_gateio = self.price_cache.get('gateio', symbol)
@@ -80,92 +150,105 @@ class OrderExecutor:
                             f"{signal.spread_pct:.3f}% -> {live_spread:.3f}%")
                 return False
         
-        # Determine entry prices and quantities
+        # Determine entry prices
         if signal.direction.value == 'long_bybit':
-            # Long Bybit (buy at ask), Short Gate.io (sell at bid)
             entry_price_long = fresh_bybit.ask if fresh_bybit else signal.price_bybit.ask
             entry_price_short = fresh_gateio.bid if fresh_gateio else signal.price_gateio.bid
         else:
-            # Long Gate.io (buy at ask), Short Bybit (sell at bid)
             entry_price_long = fresh_gateio.ask if fresh_gateio else signal.price_gateio.ask
             entry_price_short = fresh_bybit.bid if fresh_bybit else signal.price_bybit.bid
         
-        qty = self.settings.max_position_usdt / entry_price_long
+        raw_qty = self.settings.max_position_usdt / entry_price_long
+
+        # FIX 3: Round qty to valid lot step for each exchange
+        bybit_qty, gateio_qty = await self._round_entry_qty(symbol, raw_qty)
         
         try:
             if self.mode == 'paper':
                 bybit_result, gateio_result = await self.paper_engine.execute_entry(
                     signal, self.settings.max_position_usdt, self.settings.leverage)
-                success = bybit_result.success and gateio_result.success
+
+                # FIX 2: Partial fill validation
+                qty_bybit = _get_qty(bybit_result)
+                qty_gateio = _get_qty(gateio_result)
+                if qty_bybit > 0 and qty_gateio > 0:
+                    max_qty = max(qty_bybit, qty_gateio)
+                    min_qty = min(qty_bybit, qty_gateio)
+                    mismatch_pct = (1 - min_qty / max_qty) * 100
+                    if mismatch_pct > MAX_QTY_MISMATCH_PCT:
+                        logger.warning(f"[{symbol}] Partial fill DETECTED: bybit={qty_bybit:.6f} gateio={qty_gateio:.6f} "
+                                       f"(mismatch={mismatch_pct:.2f}%)")
+                        return False
+
+                success = _get_success(bybit_result) and _get_success(gateio_result)
                 if not success:
                     logger.warning(f"[{symbol}] Paper entry FAILED: insufficient balance or error")
                 
                 # BUG 3 FIX: use slippage-adjusted fill prices from paper engine
-                fill_bybit_price = bybit_result.price if bybit_result.success else entry_price_long
-                fill_gateio_price = gateio_result.price if gateio_result.success else entry_price_short
-                # Use actual fill quantity from paper engine
-                fill_bybit_qty = bybit_result.quantity if bybit_result.success else qty
-                fill_gateio_qty = gateio_result.quantity if gateio_result.success else qty
+                fill_bybit_price = _get_price(bybit_result) if _get_success(bybit_result) else entry_price_long
+                fill_gateio_price = _get_price(gateio_result) if _get_success(gateio_result) else entry_price_short
             else:
                 # Live mode: set leverage + market orders in parallel
                 await asyncio.gather(
                     self.bybit.set_leverage(symbol, self.settings.leverage),
                     self.gateio.set_leverage(self._gateio_sym(symbol), self.settings.leverage)
                 )
-                
+
+                # Use rounded quantities for live orders
                 if signal.direction.value == 'long_bybit':
                     bybit_result, gateio_result = await asyncio.gather(
-                        self.bybit.place_market_order(symbol, 'buy', str(qty)),
-                        self.gateio.place_market_order(self._gateio_sym(symbol), 'sell', str(qty))
+                        self.bybit.place_market_order(symbol, 'buy', str(bybit_qty)),
+                        self.gateio.place_market_order(self._gateio_sym(symbol), 'sell', str(gateio_qty))
                     )
                 else:
                     gateio_result, bybit_result = await asyncio.gather(
-                        self.gateio.place_market_order(self._gateio_sym(symbol), 'buy', str(qty)),
-                        self.bybit.place_market_order(symbol, 'sell', str(qty))
+                        self.gateio.place_market_order(self._gateio_sym(symbol), 'buy', str(gateio_qty)),
+                        self.bybit.place_market_order(symbol, 'sell', str(bybit_qty))
                     )
-                
-                # BUG 1: now bybit_result/gateio_result have normalized 'success' field
-                success = bybit_result.get('success', False) and gateio_result.get('success', False)
+
+                # FIX 2: Partial fill validation (live)
+                qty_bybit = _get_qty(bybit_result)
+                qty_gateio = _get_qty(gateio_result)
+                if qty_bybit > 0 and qty_gateio > 0:
+                    max_qty = max(qty_bybit, qty_gateio)
+                    min_qty = min(qty_bybit, qty_gateio)
+                    mismatch_pct = (1 - min_qty / max_qty) * 100
+                    if mismatch_pct > MAX_QTY_MISMATCH_PCT:
+                        logger.error(f"[{symbol}] LIVE partial fill DETECTED: bybit={qty_bybit:.6f} gateio={qty_gateio:.6f} "
+                                     f"(mismatch={mismatch_pct:.2f}%)")
+                        # Trigger abort
+                        success = False
+                        gateio_result['success'] = False
+                    else:
+                        success = _get_success(bybit_result) and _get_success(gateio_result)
+                else:
+                    success = _get_success(bybit_result) and _get_success(gateio_result)
+
                 if not success:
-                    logger.error(f"[{symbol}] Live entry FAILED — bybit: {bybit_result.get('error')}, "
-                                 f"gateio: {gateio_result.get('error')}")
+                    logger.error(f"[{symbol}] Live entry FAILED — bybit: {_get_error(bybit_result)}, "
+                                 f"gateio: {_get_error(gateio_result)}")
                 
-                # BUG 3 FIX: use avg fill price from exchange response if available
-                fill_bybit_price = bybit_result.get('price', entry_price_long)
-                fill_gateio_price = gateio_result.get('price', entry_price_short)
+                fill_bybit_price = _get_price(bybit_result) if _get_success(bybit_result) else entry_price_long
+                fill_gateio_price = _get_price(gateio_result) if _get_success(gateio_result) else entry_price_short
                 if fill_bybit_price <= 0:
                     fill_bybit_price = entry_price_long
                     logger.warning(f"[{symbol}] Live entry: Bybit fill price unavailable, using estimate {entry_price_long}")
                 if fill_gateio_price <= 0:
                     fill_gateio_price = entry_price_short
                     logger.warning(f"[{symbol}] Live entry: Gate.io fill price unavailable, using estimate {entry_price_short}")
-                fill_bybit_qty = bybit_result.get('quantity', qty)
-                fill_gateio_qty = gateio_result.get('quantity', qty)
             
             execution_ms = int((time.time() - start_time) * 1000)
             
-            # Match the canonical spread formula: (bybit - gateio) / gateio * 100
-            # Use actual fill prices for spread calculation
             if signal.direction.value == 'long_bybit':
-                bybit_actual = fill_bybit_price   # bybit ask (buying) — actual fill
-                gateio_actual = fill_gateio_price  # gateio bid (selling) — actual fill
+                bybit_actual = fill_bybit_price
+                gateio_actual = fill_gateio_price
             else:
-                bybit_actual = fill_gateio_price if self.mode == 'paper' else fill_bybit_price
-                # Let's be correct: for long_gateio, Bybit is the short (sell) leg, Gate.io is the long (buy) leg
-                bybit_actual = fill_bybit_price  # bybit bid (selling)
-                gateio_actual = fill_gateio_price  # gateio ask (buying)
+                bybit_actual = fill_bybit_price
+                gateio_actual = fill_gateio_price
             actual_spread = ((bybit_actual - gateio_actual) / gateio_actual) * 100
             slippage = abs(signal.spread_pct) - abs(actual_spread)
             
             if success:
-                # Record position — use fill prices from paper engine or exchange
-                if signal.direction.value == 'long_bybit':
-                    entry_px_bybit = fill_bybit_price
-                    entry_px_gateio = fill_gateio_price
-                else:
-                    entry_px_bybit = fill_bybit_price
-                    entry_px_gateio = fill_gateio_price
-                
                 trade_data = {
                     'mode': self.mode,
                     'symbol': symbol,
@@ -176,8 +259,8 @@ class OrderExecutor:
                     'actual_spread_pct': actual_spread,
                     'slippage_pct': slippage,
                     'execution_ms': execution_ms,
-                    'entry_price_bybit': entry_px_bybit,
-                    'entry_price_gateio': entry_px_gateio,
+                    'entry_price_bybit': fill_bybit_price,
+                    'entry_price_gateio': fill_gateio_price,
                     'size_usdt': self.settings.max_position_usdt,
                     'leverage': self.settings.leverage,
                     'status': 'open'
@@ -190,19 +273,21 @@ class OrderExecutor:
                 # Abort: close any successful leg to return to flat
                 if self.mode == 'live':
                     try:
+                        abort_qty_bybit = str(bybit_qty)
+                        abort_qty_gateio = str(gateio_qty)
                         if signal.direction.value == 'long_bybit':
-                            if bybit_result.get('success', False):
-                                await self.bybit.place_market_order(symbol, 'sell', str(qty))
+                            if _get_success(bybit_result):
+                                await self.bybit.place_market_order(symbol, 'sell', abort_qty_bybit)
                                 logger.warning(f"[{symbol}] ABORT: closed Bybit leg")
-                            if gateio_result.get('success', False):
-                                await self.gateio.place_market_order(self._gateio_sym(symbol), 'buy', str(qty))
+                            if _get_success(gateio_result):
+                                await self.gateio.place_market_order(self._gateio_sym(symbol), 'buy', abort_qty_gateio)
                                 logger.warning(f"[{symbol}] ABORT: closed Gate.io leg")
                         else:
-                            if bybit_result.get('success', False):
-                                await self.bybit.place_market_order(symbol, 'buy', str(qty))
+                            if _get_success(bybit_result):
+                                await self.bybit.place_market_order(symbol, 'buy', abort_qty_bybit)
                                 logger.warning(f"[{symbol}] ABORT: closed Bybit leg")
-                            if gateio_result.get('success', False):
-                                await self.gateio.place_market_order(self._gateio_sym(symbol), 'sell', str(qty))
+                            if _get_success(gateio_result):
+                                await self.gateio.place_market_order(self._gateio_sym(symbol), 'sell', abort_qty_gateio)
                                 logger.warning(f"[{symbol}] ABORT: closed Gate.io leg")
                     except Exception as abort_err:
                         logger.error(f"[{symbol}] ABORT FAILED: {abort_err} — MANUAL INTERVENTION REQUIRED")
@@ -230,7 +315,12 @@ class OrderExecutor:
             logger.error(f"[{symbol}] Cannot exit: stale prices")
             return False
         
-        # BUG 4 FIX: use correct entry price for qty calculation
+        # FIX 4: Health check before exit too
+        if not await self._health_check(symbol):
+            logger.error(f"[{symbol}] EXIT BLOCKED: exchange health check failed")
+            return False
+        
+        # qty calculation (direction-aware — BUG 4 fix)
         if pos['direction'] == 'long_bybit':
             qty = pos['size_usdt'] / pos.get('entry_price_bybit', 1)
         else:
@@ -240,15 +330,12 @@ class OrderExecutor:
             if self.mode == 'paper':
                 bybit_result, gateio_result = await self.paper_engine.execute_exit(
                     type('Pos', (), pos)(), fresh_bybit, fresh_gateio)
-                exit_bybit_price = bybit_result.price if bybit_result.success else (
+                exit_bybit_price = _get_price(bybit_result) if _get_success(bybit_result) else (
                     fresh_bybit.bid if pos['direction'] == 'long_bybit' else fresh_bybit.ask)
-                exit_gateio_price = gateio_result.price if gateio_result.success else (
+                exit_gateio_price = _get_price(gateio_result) if _get_success(gateio_result) else (
                     fresh_gateio.ask if pos['direction'] == 'long_bybit' else fresh_gateio.bid)
             else:
-                # Live: close both legs
-                # BUG 4: qty already calculated above with correct entry price
                 if pos['direction'] == 'long_bybit':
-                    # Close long Bybit (sell), close short Gate.io (buy)
                     bybit_result, gateio_result = await asyncio.gather(
                         self.bybit.place_market_order(symbol, 'sell', str(qty)),
                         self.gateio.place_market_order(self._gateio_sym(symbol), 'buy', str(qty))
@@ -259,10 +346,11 @@ class OrderExecutor:
                         self.bybit.place_market_order(symbol, 'buy', str(qty))
                     )
                 
-                exit_bybit_price = bybit_result.get('price', fresh_bybit.bid if pos['direction'] == 'long_bybit' else fresh_bybit.ask)
-                exit_gateio_price = gateio_result.get('price', fresh_gateio.ask if pos['direction'] == 'long_bybit' else fresh_gateio.bid)
+                exit_bybit_price = _get_price(bybit_result) or (
+                    fresh_bybit.bid if pos['direction'] == 'long_bybit' else fresh_bybit.ask)
+                exit_gateio_price = _get_price(gateio_result) or (
+                    fresh_gateio.ask if pos['direction'] == 'long_bybit' else fresh_gateio.bid)
             
-            # Calculate PnL — use consistent qty throughout
             from strategy.spread_arb import SpreadArbStrategy
             strategy = SpreadArbStrategy(self.settings)
             pnl = strategy.calc_pnl(

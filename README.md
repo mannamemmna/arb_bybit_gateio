@@ -142,6 +142,23 @@ Artinya: bot hanya entry jika gross spread ≥ 0.82%, sehingga net profit ≥ 0.
 [Gate.io]                                                   [Telegram Notifier]
 ```
 
+## Patch Notes (v2 — BUG FIXES)
+
+### 🔴 BUG 1 — Order result parsing (CRITICAL)
+`place_market_order()` di kedua exchange return `{success, price, order_id, error}` — cek `retCode==0` (Bybit) / HTTP 200 + field `id` (Gate.io). Avg fill price di-fetch dari response exchange (fallback estimasi). Fix di `exchanges/bybit.py`, `exchanges/gateio.py`, `core/executor.py`.
+
+### 🔴 BUG 2 — Orderbook depth check (CRITICAL)
+`_validate_signal()` step 5 sekarang aktif — fetch orderbook kedua exchange via `_refresh_orderbook()`, lalu `check_liquidity()` dengan VWAP simulation. Signal ditolak jika likuiditas tidak mencukupi. Fix di `core/spread_engine.py`, `main.py`.
+
+### 🟠 BUG 3 — Entry price slippage (MAJOR)
+Entry price di DB pakai **fill price aktual** (slippage-adjusted di paper mode, avg fill price di live mode), bukan mid-market estimate. `actual_spread` & `slippage_pct` dihitung dari harga final. Fix di `core/executor.py`.
+
+### 🟠 BUG 4 — Exit quantity long_gateio (MAJOR)
+Qty exit untuk posisi `long_gateio` dihitung dari `entry_price_gateio` (bukan selalu `entry_price_bybit`). Fix di `core/executor.py` & `paper/paper_engine.py`.
+
+### 🟢 BUG 5 — Duration hardcoded (MINOR)
+`notify_engine_stop()` sekarang tampilkan duration real via `fmt_duration()`. Fix di `telegram_bot/notifier.py` & `main.py`.
+
 ## Troubleshooting
 
 - **API Key Error**: Cek `.env`, pastikan key & secret benar

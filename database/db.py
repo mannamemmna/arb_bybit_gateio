@@ -64,6 +64,25 @@ class Database:
                 latency_ms  INTEGER
             )
         """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS rebalance_history (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                   INTEGER NOT NULL,
+                mode                 TEXT NOT NULL,
+                from_exchange        TEXT NOT NULL,
+                to_exchange          TEXT NOT NULL,
+                amount               REAL NOT NULL,
+                fee_usdt             REAL DEFAULT 0,
+                network              TEXT,
+                tx_hash              TEXT,
+                status               TEXT DEFAULT 'pending',
+                confirmed_ts         INTEGER,
+                balance_bybit_before REAL,
+                balance_gateio_before REAL,
+                balance_bybit_after  REAL,
+                balance_gateio_after  REAL
+            )
+        """)
 
     async def close(self):
         if self.db:
@@ -202,3 +221,55 @@ class Database:
             (ts, exchange, conn_index, event, retry_count, latency_ms),
         )
         await self.db.commit()
+
+    # ── rebalance_history CRUD ───────────────────────────────────
+
+    async def insert_rebalance_log(self, log: dict) -> int:
+        cursor = await self.db.execute(
+            """INSERT INTO rebalance_history
+               (ts, mode, from_exchange, to_exchange, amount, fee_usdt, network,
+                tx_hash, status, balance_bybit_before, balance_gateio_before,
+                balance_bybit_after, balance_gateio_after)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                log.get("ts", int(time.time() * 1000)),
+                log["mode"],
+                log["from_exchange"],
+                log["to_exchange"],
+                log["amount"],
+                log.get("fee_usdt", 0),
+                log.get("network"),
+                log.get("tx_hash"),
+                log.get("status", "pending"),
+                log.get("balance_bybit_before"),
+                log.get("balance_gateio_before"),
+                log.get("balance_bybit_after"),
+                log.get("balance_gateio_after"),
+            ),
+        )
+        await self.db.commit()
+        return cursor.lastrowid
+
+    async def update_rebalance_status(self, record_id: int, status: str,
+                                       confirmed_ts: int = None) -> None:
+        if confirmed_ts:
+            await self.db.execute(
+                "UPDATE rebalance_history SET status = ?, confirmed_ts = ? WHERE id = ?",
+                (status, confirmed_ts, record_id),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE rebalance_history SET status = ? WHERE id = ?",
+                (status, record_id),
+            )
+        await self.db.commit()
+
+    async def get_daily_rebalance_total(self) -> float:
+        today_start = int(time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, 0))) * 1000
+        cursor = await self.db.execute(
+            """SELECT COALESCE(SUM(amount), 0) FROM rebalance_history
+               WHERE ts >= ? AND status IN ('confirmed', 'simulated', 'pending')""",
+            (today_start,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0.0

@@ -13,6 +13,9 @@ class CommandHandler:
     def __init__(self, engine, authorized_user_id: int):
         self.engine = engine
         self.authorized_user_id = authorized_user_id
+        # Rebalance reference (set externally by main.py or bot.py)
+        self.rebalancer = engine.rebalancer if engine and hasattr(engine, 'rebalancer') else None
+        self.settings = engine.settings if engine else None
 
     def _check_auth(self, update: Update) -> bool:
         return update.effective_user.id == self.authorized_user_id
@@ -403,3 +406,129 @@ class CommandHandler:
         if not self._check_auth(update):
             return
         await update.message.reply_text("ℹ️ No pending orders to cancel (market orders only)", parse_mode="MarkdownV2")
+
+    # ── /balance ──────────────────────────────────────────────────────
+    async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """ /balance — Show account balances across both exchanges. """
+        if not self._check_auth(update):
+            return
+        if not self.rebalancer:
+            await update.message.reply_text("ℹ️ Rebalance module not loaded", parse_mode="MarkdownV2")
+            return
+
+        balances = await self.rebalancer.get_balances()
+        imbalance = self.rebalancer._calc_imbalance(balances)
+        bybit_pct = (balances['bybit'] / balances['total'] * 100) if balances['total'] > 0 else 0
+        gateio_pct = (balances['gateio'] / balances['total'] * 100) if balances['total'] > 0 else 0
+
+        # Determine balance status label
+        if self.rebalancer._pending_tx:
+            status_label = "🔄 rebalancing"
+        elif imbalance['needs_rebalance']:
+            status_label = "⚠️ imbalanced"
+        else:
+            status_label = "✅ balanced"
+
+        mode_label = self.rebalancer.mode.upper()
+        text = (
+            f"💳 *Account Balances*  •  {esc(mode_label)}\n"
+            f"{SEP}\n"
+            f"Bybit     `{fmt_usdt(balances['bybit'])}`  \\({esc(f'{bybit_pct:.1f}')}%\\)\n"
+            f"Gate\\.io  `{fmt_usdt(balances['gateio'])}`  \\({esc(f'{gateio_pct:.1f}')}%\\)\n"
+            f"{SEP}\n"
+            f"Total     `{fmt_usdt(balances['total'])}`\n"
+            f"Diff      `{fmt_usdt(imbalance['diff_usdt'])}`  {status_label}\n"
+            f"Threshold `{fmt_usdt(self.settings.rebalance_threshold_usdt)}` \\| "
+            f"{esc(f'{self.settings.rebalance_threshold_pct:.0f}')}%\n"
+            f"{SEP}\n"
+            f"Auto\\-rebalance  {'ON' if self.rebalancer._auto_enabled else 'OFF'}\n"
+            f"🕐 {_ts()}"
+        )
+        await update.message.reply_text(text, parse_mode="MarkdownV2")
+
+    # ── /rebalance ────────────────────────────────────────────────────
+    async def cmd_rebalance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """ /rebalance [status|auto on|off|confirm] — Manage rebalance. """
+        if not self._check_auth(update):
+            return
+        if not self.rebalancer:
+            await update.message.reply_text("ℹ️ Rebalance module not loaded", parse_mode="MarkdownV2")
+            return
+
+        args = context.args if context.args else []
+
+        # /rebalance status
+        if args and args[0] == 'status':
+            status = await self.rebalancer.get_status()
+            pending = self.rebalancer.get_pending_tx()
+            if pending:
+                text = (
+                    f"🔄 *Transfer In Progress*\n"
+                    f"{SEP}\n"
+                    f"TX      `{esc(pending['tx_id'])}`\n"
+                    f"From    {esc(pending['from'].capitalize())}\n"
+                    f"To      {esc(pending['to'].capitalize())}\n"
+                    f"Amount  `{fmt_usdt(pending['amount'])}`\n"
+                    f"Status  Waiting confirmation\\.\\.\\."
+                )
+            else:
+                text = "✅ No pending transfers"
+            await update.message.reply_text(text, parse_mode="MarkdownV2")
+            return
+
+        # /rebalance auto on/off
+        if len(args) == 2 and args[0] == 'auto':
+            new_state = args[1] == 'on'
+            self.rebalancer.set_auto(new_state)
+            icon = "✅" if new_state else "⏹️"
+            await update.message.reply_text(
+                f"{icon} Auto\\-rebalance `{'ON' if new_state else 'OFF'}`",
+                parse_mode="MarkdownV2"
+            )
+            return
+
+        # /rebalance confirm — execute pending rebalance
+        if args and args[0] == 'confirm':
+            result = await self.rebalancer.check_and_rebalance(force=True)
+            if result['status'] in ('simulated', 'pending'):
+                await update.message.reply_text(
+                    f"✅ Rebalance {'simulated' if result['status'] == 'simulated' else 'initiated'}: "
+                    f"`{fmt_usdt(result['amount'])}` USDT",
+                    parse_mode="MarkdownV2"
+                )
+            else:
+                await update.message.reply_text(
+                    f"ℹ️ {result['status']}",
+                    parse_mode="MarkdownV2"
+                )
+            return
+
+        # /rebalance — execute now (shows preview if require_confirm=True)
+        result = await self.rebalancer.check_and_rebalance(force=True)
+        if result['status'] == 'pending_confirm':
+            # Preview already sent by rebalancer via notifier, just confirm
+            text = (
+                f"⚖️ *Rebalance Preview*\n"
+                f"{SEP}\n"
+                f"From    {esc(result['imbalance']['from_exchange'].capitalize())}\n"
+                f"To      {esc(result['imbalance']['to_exchange'].capitalize())}\n"
+                f"Amount  `{fmt_usdt(result['imbalance']['transfer_amount'])}`\n"
+                f"Network {esc(self.settings.rebalance_network)}\n"
+                f"{SEP}\n"
+                f"Reply `/rebalance confirm` to proceed"
+            )
+            await update.message.reply_text(text, parse_mode="MarkdownV2")
+        elif result['status'] == 'balanced':
+            await update.message.reply_text(
+                f"✅ *Already Balanced*\n"
+                f"Diff: `{fmt_usdt(result['imbalance']['diff_usdt'])}` "
+                f"\\(threshold: `{fmt_usdt(self.settings.rebalance_threshold_usdt)}`\\)",
+                parse_mode="MarkdownV2"
+            )
+        elif result['status'] in ('simulated', 'pending'):
+            await update.message.reply_text(
+                f"✅ Rebalance completed: `{fmt_usdt(result['amount'])}` USDT",
+                parse_mode="MarkdownV2"
+            )
+        else:
+            await update.message.reply_text(f"ℹ️ {result['status']}", parse_mode="MarkdownV2")

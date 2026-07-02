@@ -29,6 +29,7 @@ from strategy.spread_arb import SpreadArbStrategy
 from paper.paper_engine import PaperEngine
 from telegram_bot.bot import ArbitrageBot
 from telegram_bot.notifier import Notifier
+from rebalance.rebalancer import RebalanceManager
 from utils.logger import setup_logger, get_logger
 
 logger = get_logger('main')
@@ -113,6 +114,15 @@ class ArbitrageEngine:
             user_id=self.settings.telegram_user_id,
         )
 
+        # Rebalance manager
+        self.rebalancer = RebalanceManager(
+            bybit_client=self.bybit_client,
+            gateio_client=self.gateio_client,
+            settings=self.settings,
+            db=self.db,
+            notifier=self.notifier,
+        )
+
         self.running = False
         self.start_time = None
 
@@ -138,6 +148,8 @@ class ArbitrageEngine:
             mode=self.settings.trading_mode,
             settings=self.settings,
         )
+        # Wire orderbook cache to paper engine for realistic VWAP slippage
+        self.paper_engine.ob_cache = self.ob_cache
 
         # Spread engine
         self.spread_engine = SpreadEngine(
@@ -169,6 +181,13 @@ class ArbitrageEngine:
         # Setup Telegram bot
         await self.bot.setup()
         await self.bot.start()
+
+        # Setup rebalance manager
+        if self.settings.rebalance_enabled:
+            self.rebalancer.set_open_count_getter(lambda: self.position_tracker.open_count)
+            self.rebalancer.set_is_executing_getter(lambda: False)  # simplified
+            await self.rebalancer.start()
+            logger.info("Rebalance manager started")
 
         logger.info("Engine initialized successfully")
 
@@ -293,6 +312,8 @@ class ArbitrageEngine:
         logger.info("Shutting down...")
         if self.running:
             await self.stop("shutdown")
+        if self.rebalancer:
+            await self.rebalancer.stop()
         await self.bot.stop()
         await self.db.close()
         logger.info("Shutdown complete")

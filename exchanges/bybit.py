@@ -319,3 +319,66 @@ class BybitClient(ExchangeClient):
                     'leverage': float(p.get('leverage', 1)),
                 })
         return positions
+
+    async def withdraw_usdt(self, address: str, amount: float, network: str = 'TRC20') -> dict:
+        """
+        Initiate USDT withdrawal from Bybit.
+
+        API: POST /v5/asset/withdraw/create
+        Docs: https://bybit-exchange.github.io/docs/v5/asset/withdraw
+
+        PENTING: address harus sudah di-whitelist di Bybit account settings.
+        """
+        params = {
+            'coin': 'USDT',
+            'chain': network,
+            'address': address,
+            'amount': str(round(amount, 2)),
+            'accountType': 'FUND',
+            'timestamp': str(int(time.time() * 1000)),
+        }
+        logger.info("Bybit withdraw_usdt: %.2f USDT -> %s (%s)", amount, address, network)
+        result = await self._rest_post('/v5/asset/withdraw/create', params)
+        return {
+            'tx_id': result.get('id', ''),
+            'fee': None,
+        }
+
+    # ── Instrument info cache (for quantity rounding) ────────────
+    _instrument_info: dict[str, dict] = {}
+
+    async def fetch_instrument_info(self, symbol: str) -> dict:
+        """Fetch lot size info for a perpetual symbol. Cached 1h."""
+        if symbol in self._instrument_info:
+            return self._instrument_info[symbol]
+        result = await self._rest_get('/v5/market/instruments-info', {
+            'category': 'linear', 'symbol': symbol,
+        })
+        items = result.get('list', [])
+        info = {}
+        if items:
+            ls = items[0].get('lotSizeFilter', {})
+            info = {
+                'lot_step': float(ls.get('lotStep', 0.001)),
+                'min_order_qty': float(ls.get('minOrderQty', 0.001)),
+                'max_order_qty': float(ls.get('maxOrderQty', 1000000)),
+                'qty_step': float(ls.get('qtyStep', 0.001)),
+            }
+        self._instrument_info[symbol] = info
+        return info
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        """Round qty to valid lot step for the symbol."""
+        info = self._instrument_info.get(symbol, {})
+        step = info.get('lot_step', 0.001)
+        if step <= 0:
+            step = 0.001
+        rounded = round(qty / step) * step
+        # Clamp to min/max
+        min_q = info.get('min_order_qty', 0.001)
+        max_q = info.get('max_order_qty', 1000000)
+        if rounded < min_q:
+            return min_q
+        if rounded > max_q:
+            return max_q
+        return rounded
