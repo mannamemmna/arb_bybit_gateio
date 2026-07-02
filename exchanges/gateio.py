@@ -251,15 +251,58 @@ class GateioClient(ExchangeClient):
         }
 
     async def place_market_order(self, symbol: str, side: str, qty: str) -> dict:
+        size_val = float(qty)
+        # Gate.io: positive = buy, negative = sell
         params = {
             'contract': symbol,
-            'size': max(1, round(float(qty))) if side.lower() == 'buy' else -max(1, round(float(qty))),  # TODO: use contract quanto_multiplier for proper conversion
+            'size': size_val if side.lower() == 'buy' else -size_val,
             'price': '0',  # market
             'tif': 'ioc',
             'text': 't-arb-bot',
         }
         logger.info("Gate.io place_market_order: %s %s %s", symbol, side, qty)
-        return await self._rest_post('/api/v4/futures/usdt/orders', params)
+
+        body = json.dumps(params)
+        url = f"{GATEIO_REST_BASE}/api/v4/futures/usdt/orders"
+        headers = self._sign("POST", "/api/v4/futures/usdt/orders", body=body)
+
+        session = await self._get_session()
+        async with gateio_private_limiter:
+            async with session.post(url, headers=headers, data=body) as resp:
+                data = await resp.json()
+
+        if resp.status in (200, 201) and 'id' in data:
+            # Parse fill info
+            order_id = data.get('id', '')
+            fill_price = float(data.get('fill_price', 0))
+            # For IOC market orders, 'size' in response could be the filled qty
+            filled_qty = abs(float(data.get('fill_total_quantity', 0)))
+            if filled_qty <= 0:
+                filled_qty = size_val  # fallback to request qty
+
+            return {
+                "success": True,
+                "exchange": "gateio",
+                "symbol": symbol,
+                "side": side,
+                "price": fill_price,
+                "quantity": filled_qty,
+                "order_id": order_id,
+                "error": None,
+            }
+        else:
+            err_msg = data.get('label', str(data)) if isinstance(data, dict) else str(data)
+            logger.error("Gate.io place_market_order FAILED: %s", err_msg)
+            return {
+                "success": False,
+                "exchange": "gateio",
+                "symbol": symbol,
+                "side": side,
+                "price": 0,
+                "quantity": 0,
+                "order_id": "",
+                "error": err_msg,
+            }
 
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         try:

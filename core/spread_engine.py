@@ -1,4 +1,5 @@
 import time
+import asyncio
 from typing import Optional, Callable, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -51,10 +52,13 @@ class SpreadEngine:
         preflight_spread_decay: float,
         use_orderbook_check: bool,
         orderbook_depth: int,
+        max_position_usdt: float = 50.0,
         position_tracker=None,
         on_signal: Optional[Callable] = None,
         on_exit: Optional[Callable] = None,
         max_open_positions: int = 5,
+        bybit_client=None,
+        gateio_client=None,
     ):
         self.price_cache = price_cache
         self.ob_cache = orderbook_cache
@@ -65,16 +69,35 @@ class SpreadEngine:
         self.preflight_spread_decay = preflight_spread_decay
         self.use_orderbook_check = use_orderbook_check
         self.orderbook_depth = orderbook_depth
+        self.max_position_usdt = max_position_usdt
         self.position_tracker = position_tracker
         self.max_open_positions = max_open_positions
         self.on_signal = on_signal  # async callback(signal: Signal)
         self.on_exit = on_exit      # async callback(symbol: str, spread_pct: float)
+        self.bybit_client = bybit_client
+        self.gateio_client = gateio_client
 
         # Derived
         self.internal_threshold = entry_threshold + round_trip_fee + slippage_buffer
 
         self._signal_count: int = 0
         self._rejected_count: int = 0
+
+    async def _refresh_orderbook(self, symbol: str) -> None:
+        """Fetch orderbook snapshot from both exchanges and update cache."""
+        if not self.bybit_client or not self.gateio_client:
+            return
+
+        gateio_symbol = symbol.replace('USDT', '_USDT')
+        try:
+            bybit_ob, gateio_ob = await asyncio.gather(
+                self.bybit_client.fetch_orderbook(symbol, depth=self.orderbook_depth),
+                self.gateio_client.fetch_orderbook(gateio_symbol, depth=self.orderbook_depth),
+            )
+            self.ob_cache.update('bybit', symbol, bybit_ob.get('bids', []), bybit_ob.get('asks', []))
+            self.ob_cache.update('gateio', symbol, gateio_ob.get('bids', []), gateio_ob.get('asks', []))
+        except Exception as e:
+            logger.warning(f"[{symbol}] Orderbook fetch failed: {e}")
 
     async def on_price_update(self, exchange: str, symbol: str) -> None:
         """
@@ -169,8 +192,15 @@ class SpreadEngine:
 
         # 5. Orderbook depth check
         if self.use_orderbook_check:
-            # TODO: implement when orderbook data available
-            pass
+            await self._refresh_orderbook(symbol)
+            is_ok, actual_spread = self.ob_cache.check_liquidity(
+                symbol,
+                size_usdt=self.max_position_usdt,
+                depth=self.orderbook_depth,
+                internal_threshold=self.internal_threshold,
+            )
+            if not is_ok:
+                return False, f"insufficient orderbook liquidity (actual_spread={actual_spread:.3f}%)"
 
         return True, "ok"
 

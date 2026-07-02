@@ -217,7 +217,64 @@ class BybitClient(ExchangeClient):
             'qty': qty,
         }
         logger.info("Bybit place_market_order: %s %s %s", symbol, side, qty)
-        return await self._rest_post('/v5/order/create', params)
+
+        # Send request directly (not via _rest_post) to access raw response
+        async with bybit_private_limiter:
+            session = await self._get_session()
+            req = await self._sign_request("POST", "/v5/order/create", params)
+            async with session.post(req["url"], headers=req["headers"],
+                                    data=req["body"]) as resp:
+                raw = await resp.json()
+
+        ret_code = raw.get('retCode', -1)
+        ret_msg = raw.get('retMsg', 'unknown')
+        result = raw.get('result', {})
+
+        if ret_code == 0:
+            order_id = result.get('orderId', '')
+            # Try to derive avg fill price from cumExecValue / cumExecQty
+            avg_price = 0.0
+            cum_exec_qty = float(result.get('cumExecQty', '0'))
+            cum_exec_value = float(result.get('cumExecValue', '0'))
+            if cum_exec_qty > 0 and cum_exec_value > 0:
+                avg_price = cum_exec_value / cum_exec_qty
+
+            # If avg_price still 0 and order was filled, fetch order detail
+            # (one extra REST call) to get actual fill price.
+            if avg_price <= 0 and order_id:
+                try:
+                    detail = await self._rest_get(
+                        '/v5/order/realtime',
+                        {'category': 'linear', 'symbol': symbol, 'orderId': order_id},
+                    )
+                    detail_list = detail.get('list', [])
+                    if detail_list:
+                        avg_price = float(detail_list[0].get('avgPrice', 0))
+                except Exception as e:
+                    logger.warning("Bybit fetch avgPrice failed: %s", e)
+
+            return {
+                "success": True,
+                "exchange": "bybit",
+                "symbol": symbol,
+                "side": side,
+                "price": avg_price,
+                "quantity": float(qty),
+                "order_id": order_id,
+                "error": None,
+            }
+        else:
+            logger.error("Bybit place_market_order FAILED: %s", ret_msg)
+            return {
+                "success": False,
+                "exchange": "bybit",
+                "symbol": symbol,
+                "side": side,
+                "price": 0,
+                "quantity": 0,
+                "order_id": "",
+                "error": ret_msg,
+            }
 
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         params = {

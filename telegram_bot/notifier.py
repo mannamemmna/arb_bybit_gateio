@@ -43,13 +43,14 @@ class Notifier:
         await self.send(text)
 
     # ── Engine STOP (spec section 4) ────────────────────────────────
-    async def notify_engine_stop(self, reason: str, trade_count: int, net_pnl: float):
+    async def notify_engine_stop(self, reason: str, trade_count: int, net_pnl: float,
+                                 duration_sec: int = 0):
         text = (
             f"⛔ *Engine Stopped*\n"
             f"{SEP}\n"
             f"Session trades    `{trade_count}`\n"
             f"Session net PnL   `{fmt_pnl(net_pnl)}` USDT\n"
-            f"Duration          `—`\n"
+            f"Duration          `{fmt_duration(duration_sec)}`\n"
             f"{SEP}\n"
             f"🕐 {_ts()}"
         )

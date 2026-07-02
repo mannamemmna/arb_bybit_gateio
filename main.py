@@ -150,9 +150,12 @@ class ArbitrageEngine:
             preflight_spread_decay=self.settings.preflight_spread_decay,
             use_orderbook_check=self.settings.use_orderbook_depth_check,
             orderbook_depth=self.settings.orderbook_depth,
+            max_position_usdt=self.settings.max_position_usdt,
             position_tracker=self.position_tracker,
             on_signal=self._on_signal,
             on_exit=self._on_exit,
+            bybit_client=self.bybit_client,
+            gateio_client=self.gateio_client,
         )
 
         # Wire WS pool callbacks
@@ -274,6 +277,7 @@ class ArbitrageEngine:
             reason=reason,
             trade_count=summary.get("total_trades", 0),
             net_pnl=summary.get("total_pnl", 0),
+            duration_sec=int(time.time() - self.start_time) if self.start_time else 0,
         )
 
         logger.info(f"Engine stopped. Closed {closed} positions.")
